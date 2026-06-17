@@ -10,6 +10,7 @@ import os
 import pandas as pd
 
 from surveillance.runner import run_surveillance, summarize
+from surveillance.metrics import score, format_scorecard
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 # Known intelligence input: ACCT005 / ACCT006 share a beneficial owner.
@@ -22,15 +23,8 @@ def _load(name):
 
 def validate(alerts: pd.DataFrame):
     labels = _load("labels.csv")
-    flagged = set()
-    for ids in alerts["evidence_ids"].astype(str):
-        for part in ids.replace("|", " ").split():
-            flagged.add(part)
-    print("\nDetection recall vs. planted abuse (ground truth):")
-    for abuse, grp in labels.groupby("abuse_type"):
-        truth = set(grp["id"])
-        hit = len(truth & flagged)
-        print(f"  {abuse:<18} caught {hit}/{len(truth)} planted ids")
+    scorecard = score(alerts, labels)
+    print("\n" + format_scorecard(scorecard))
 
 
 def main():

@@ -8,7 +8,10 @@ from surveillance.detectors import (
     detect_settlement_manipulation,
     detect_position_limit_breaches,
     detect_statistical_anomalies,
+    detect_layering,
+    detect_insider_timing,
 )
+from surveillance.metrics import score
 
 
 def _trade(tid, market, buyer, seller, price, qty, ts="2026-06-01 09:30:00", agg="buy"):
@@ -69,6 +72,68 @@ def test_statistical_anomaly():
     assert "BIG" in set(out["evidence_ids"])
 
 
+def _order(oid, acct, action, market="M", side="buy", qty=100,
+           ts="2026-06-01 09:30:00"):
+    return dict(order_id=oid, timestamp=ts, market_id=market, account_id=acct,
+                side=side, price=50, quantity=qty, action=action)
+
+
+def test_layering_high_cancel_ratio():
+    orders = [_order(f"O{i}", "LAY", "cancel") for i in range(18)]
+    orders += [_order(f"F{i}", "LAY", "fill") for i in range(2)]
+    out = detect_layering(pd.DataFrame(orders), min_orders=15, cancel_ratio_threshold=0.80)
+    assert len(out) == 1 and out.iloc[0]["account_id"] == "LAY"
+
+
+def test_layering_ignores_balanced_quoting():
+    orders = [_order(f"O{i}", "MM", "cancel") for i in range(10)]
+    orders += [_order(f"F{i}", "MM", "fill") for i in range(10)]
+    assert detect_layering(pd.DataFrame(orders), cancel_ratio_threshold=0.80).empty
+
+
+def test_insider_timing_dormant_accumulation():
+    rows = []
+    # established account trades throughout the day (not dormant)
+    for i in range(8):
+        rows.append(_trade(f"E{i}", "M", "OLD", "S", 50, 100,
+                           ts=f"2026-06-01 10:0{i}:00"))
+    # dormant account loads up in the final window before resolution
+    for i in range(6):
+        rows.append(_trade(f"I{i}", "M", "GHOST", "S", 55, 400,
+                           ts=f"2026-06-01 15:5{i}:00"))
+    out = detect_insider_timing(pd.DataFrame(rows), window_s=1200,
+                                dormant_max_prior=1, min_position=1500)
+    assert len(out) == 1 and out.iloc[0]["account_id"] == "GHOST"
+
+
+def test_insider_timing_ignores_established_account():
+    rows = []
+    # OLD has a long established presence well before the resolution window...
+    for i in range(10):
+        rows.append(_trade(f"P{i}", "M", "OLD", "S", 50, 400,
+                           ts=f"2026-06-01 10:0{i}:00"))
+    # ...and also trades inside the final window. Not dormant -> no flag.
+    for i in range(4):
+        rows.append(_trade(f"W{i}", "M", "OLD", "S", 55, 400,
+                           ts=f"2026-06-01 15:5{i}:00"))
+    assert detect_insider_timing(pd.DataFrame(rows), window_s=1200,
+                                 dormant_max_prior=1, min_position=1500).empty
+
+
+def test_metrics_precision_and_recall():
+    alerts = pd.DataFrame([
+        dict(detector="wash_trade", severity="high", market_id="M",
+             account_id="A", detail="", evidence_ids="W1"),       # true positive
+        dict(detector="wash_trade", severity="high", market_id="M",
+             account_id="A", detail="", evidence_ids="C1"),       # false positive (clean)
+    ])
+    labels = pd.DataFrame([("W1", "wash"), ("W2", "wash")], columns=["id", "abuse_type"])
+    sc = score(alerts, labels).set_index("detector").loc["wash_trade"]
+    assert sc["tp"] == 1 and sc["fp"] == 1
+    assert sc["precision"] == 0.5     # 1 of 2 alerts genuine
+    assert sc["recall"] == 0.5        # caught 1 of 2 planted wash ids
+
+
 def test_empty_inputs_safe():
     empty = pd.DataFrame(columns=["trade_id", "timestamp", "market_id", "buyer",
                                    "seller", "price", "quantity", "aggressor_side"])
@@ -76,3 +141,6 @@ def test_empty_inputs_safe():
     assert detect_settlement_manipulation(empty).empty
     assert detect_position_limit_breaches(empty).empty
     assert detect_statistical_anomalies(empty).empty
+    assert detect_insider_timing(empty).empty
+    assert detect_layering(pd.DataFrame(columns=["order_id", "account_id",
+                                                 "market_id", "action"])).empty
